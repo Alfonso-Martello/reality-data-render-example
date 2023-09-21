@@ -6,46 +6,29 @@
 import "./App.scss";
 
 import type { ScreenViewport } from "@itwin/core-frontend";
-import { FitViewTool, IModelApp, StandardViewId } from "@itwin/core-frontend";
+import { BlankConnection, IModelApp} from "@itwin/core-frontend";
 import { FillCentered } from "@itwin/core-react";
 import { ProgressLinear } from "@itwin/itwinui-react";
 import {
-  MeasurementActionToolbar,
-  MeasureTools,
-  MeasureToolsUiItemsProvider,
-} from "@itwin/measure-tools-react";
-import {
-  AncestorsNavigationControls,
-  CopyPropertyTextContextMenuItem,
-  PropertyGridManager,
-  PropertyGridUiItemsProvider,
-  ShowHideNullValuesSettingsMenuItem,
-} from "@itwin/property-grid-react";
-import {
-  TreeWidget,
-  TreeWidgetUiItemsProvider,
-} from "@itwin/tree-widget-react";
-import {
-  useAccessToken,
   Viewer,
-  ViewerContentToolsProvider,
-  ViewerNavigationToolsProvider,
-  ViewerPerformance,
-  ViewerStatusbarItemsProvider,
 } from "@itwin/web-viewer-react";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Auth } from "./Auth";
 import { history } from "./history";
+import { Cartographic } from "@itwin/core-common";
+import { Range3d } from "@itwin/core-geometry";
+import { RealityDataAccessClient } from "@itwin/reality-data-client";
+import { RealityDataManager, RealityDataProps } from "./reality-data-manager";
+import { UiFramework } from "@itwin/appui-react";
+import { DebugWidgetProvider } from "./DebugWidget";
+import { FrontendDevTools } from "@itwin/frontend-devtools";
 
 const App: React.FC = () => {
-  const [iModelId, setIModelId] = useState(process.env.IMJS_IMODEL_ID);
+  const [accessToken, setAccessToken] = React.useState<string>();
+  const [realityDataId, setRealityDataId] = useState(process.env.IMJS_REALITY_DATA_ID);
   const [iTwinId, setITwinId] = useState(process.env.IMJS_ITWIN_ID);
-  const [changesetId, setChangesetId] = useState(
-    process.env.IMJS_AUTH_CLIENT_CHANGESET_ID
-  );
-
-  const accessToken = useAccessToken();
+  const [appLoaded, setAppLoaded] = useState<boolean>(false);
 
   const authClient = Auth.getClient();
 
@@ -55,6 +38,7 @@ const App: React.FC = () => {
     } catch {
       await authClient.signIn();
     }
+    setAccessToken(await authClient.getAccessToken());
   }, [authClient]);
 
   useEffect(() => {
@@ -66,75 +50,78 @@ const App: React.FC = () => {
     if (urlParams.has("iTwinId")) {
       setITwinId(urlParams.get("iTwinId") as string);
     }
-    if (urlParams.has("iModelId")) {
-      setIModelId(urlParams.get("iModelId") as string);
-    }
-    if (urlParams.has("changesetId")) {
-      setChangesetId(urlParams.get("changesetId") as string);
+    if (urlParams.has("realityDataId")) {
+      setRealityDataId(urlParams.get("realityDataId") as string);
     }
   }, []);
 
   useEffect(() => {
     let url = `viewer?iTwinId=${iTwinId}`;
 
-    if (iModelId) {
-      url = `${url}&ModelId=${iModelId}`;
-    }
-
-    if (changesetId) {
-      url = `${url}&changesetId=${changesetId}`;
+    if (realityDataId) {
+      url = `${url}&realityDataId=${realityDataId}`;
     }
     history.push(url);
-  }, [iTwinId, iModelId, changesetId]);
+  }, [iTwinId, realityDataId]);
 
-  /** NOTE: This function will execute the "Fit View" tool after the iModel is loaded into the Viewer.
-   * This will provide an "optimal" view of the model. However, it will override any default views that are
-   * stored in the iModel. Delete this function and the prop that it is passed to if you prefer
-   * to honor default views when they are present instead (the Viewer will still apply a similar function to iModels that do not have a default view).
-   */
-  const viewConfiguration = useCallback((viewPort: ScreenViewport) => {
-    // default execute the fitview tool and use the iso standard view after tile trees are loaded
-    const tileTreesLoaded = () => {
-      return new Promise((resolve, reject) => {
-        const start = new Date();
-        const intvl = setInterval(() => {
-          if (viewPort.areAllTileTreesLoaded) {
-            ViewerPerformance.addMark("TilesLoaded");
-            ViewerPerformance.addMeasure(
-              "TileTreesLoaded",
-              "ViewerStarting",
-              "TilesLoaded"
-            );
-            clearInterval(intvl);
-            resolve(true);
-          }
-          const now = new Date();
-          // after 20 seconds, stop waiting and fit the view
-          if (now.getTime() - start.getTime() > 20000) {
-            reject();
-          }
-        }, 100);
-      });
-    };
-
-    tileTreesLoaded().finally(() => {
-      void IModelApp.tools.run(FitViewTool.toolId, viewPort, true, false);
-      viewPort.view.setStandardRotation(StandardViewId.Iso);
+  const rdaClient = useMemo(() => {
+    return new RealityDataAccessClient({
+      baseUrl: `https://api.bentley.com/reality-management/reality-data`,
+      authorizationClient: authClient
     });
-  }, []);
+  }, [authClient]);
 
-  const viewCreatorOptions = useMemo(
-    () => ({ viewportConfigurer: viewConfiguration }),
-    [viewConfiguration]
-  );
+  const getRealityDataManager =useCallback(() => {
+    if (iTwinId && realityDataId) {
+      return new RealityDataManager(iTwinId, realityDataId, rdaClient);
+    }
+  }, [iTwinId, realityDataId, rdaClient])
 
-  const onIModelAppInit = useCallback(async () => {
-    // iModel now initialized
-    await TreeWidget.initialize();
-    await PropertyGridManager.initialize();
-    await MeasureTools.startup();
-    MeasurementActionToolbar.setDefaultActionProvider();
-  }, []);
+    // Load the reality data and overwrite the blank connection
+    useEffect(() => {
+      const initialize = async () => {
+        // Only attempt render after the app has finished loading
+        if (appLoaded) {
+          const rdManager = await getRealityDataManager();
+          if (iTwinId && realityDataId && (await authClient.getAccessToken()) && rdManager) {
+            const rdProps: RealityDataProps = await rdManager.getRealityDataProps(await authClient.getAccessToken());
+            // Only render if the reality data is geo-located
+            if (
+              rdProps.geoLocation &&
+              rdProps.geoLocation.location &&
+              rdProps.geoLocation.extents &&
+              rdProps.realityData
+            ) {
+              const blankConnection = rdManager.getBlankConnection(rdProps);
+              const iModelConnection = BlankConnection.create(blankConnection);
+              const viewState = rdManager.getRealityDataViewState(rdProps, iModelConnection);
+              // Replace the blank connection of the Viewer with another updated to match the reality model
+              UiFramework.setIModelConnection(iModelConnection);
+              if (viewState) {
+                // Apply the reality data's view state to every viewport
+                for (const viewport of IModelApp.viewManager) {
+                  await rdManager.applyRealityDataViewState(viewState, viewport, rdProps);
+                }
+              }
+            }
+          }
+        }
+      };
+      void initialize();
+    }, [authClient, iTwinId, realityDataId, getRealityDataManager, appLoaded]);
+
+  // Make sure the Viewer is loaded before manipulating
+  const onIModelAppInit = async () => {
+    // Init dev tools
+    await FrontendDevTools.initialize();
+    // Listen for the screen viewport to open for the first time
+    IModelApp.viewManager.onViewOpen.addOnce((vp: ScreenViewport) => {
+      // Listen for the viewport and viewstate to synchronize for the first time
+      vp.onViewChanged.addOnce(() => {
+        setAppLoaded(true);
+      });
+    });
+  };
 
   return (
     <div className="viewer-container">
@@ -147,42 +134,16 @@ const App: React.FC = () => {
       )}
       <Viewer
         iTwinId={iTwinId ?? ""}
-        iModelId={iModelId ?? ""}
-        changeSetId={changesetId}
         authClient={authClient}
-        viewCreatorOptions={viewCreatorOptions}
-        enablePerformanceMonitors={true} // see description in the README (https://www.npmjs.com/package/@itwin/web-viewer-react)
+        // Default location to Exton campus, we will be overwriting location and extents anyways
+        location={Cartographic.fromDegrees({ longitude: -75.686694, latitude: 40.065757, height: 0 })}
+        extents={new Range3d(-1000, -1000, -100, 1000, 1000, 100)}
         onIModelAppInit={onIModelAppInit}
+        realityDataAccess={rdaClient}
         uiProviders={[
-          new ViewerNavigationToolsProvider(),
-          new ViewerContentToolsProvider({
-            vertical: {
-              measureGroup: false,
-            },
-          }),
-          new ViewerStatusbarItemsProvider(),
-          new TreeWidgetUiItemsProvider(),
-          new PropertyGridUiItemsProvider({
-            propertyGridProps: {
-              autoExpandChildCategories: true,
-              ancestorsNavigationControls: (props) => (
-                <AncestorsNavigationControls {...props} />
-              ),
-              contextMenuItems: [
-                (props) => <CopyPropertyTextContextMenuItem {...props} />,
-              ],
-              settingsMenuItems: [
-                (props) => (
-                  <ShowHideNullValuesSettingsMenuItem
-                    {...props}
-                    persist={true}
-                  />
-                ),
-              ],
-            },
-          }),
-          new MeasureToolsUiItemsProvider(),
+          new DebugWidgetProvider()
         ]}
+        enablePerformanceMonitors={true} // see description in the README (https://www.npmjs.com/package/@itwin/web-viewer-react)
       />
     </div>
   );
